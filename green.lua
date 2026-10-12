@@ -4,7 +4,7 @@
 -- it queues and fires the moment it turns READY. Right Shift opens the menu.
 -- Auto guard (N / menu): follows the opponent who has the ball; stops the moment you have it.
 
-local VERSION = "v7 (2026-10-12)" -- bump on every change; shown top-right and in the menu
+local VERSION = "v8 (2026-10-12)" -- bump on every change; shown top-right and in the menu
 
 local lp  = game.Players.LocalPlayer
 local cam = workspace.CurrentCamera
@@ -56,6 +56,19 @@ S.gen = (S.gen or 0) + 1
 if S.ui then pcall(function() S.ui:Destroy() end) S.ui = nil end
 local gen = S.gen
 
+-- crash breadcrumbs: for 5s after the guard is switched on, each step is written to
+-- green_crumbs.txt BEFORE it runs, so if the executor crashes the last line shows where.
+local crumbUntil, crumbs, lastCrumb = 0, {}, nil
+local function crumb(step)
+    -- each step is written only the first time it happens (lastCrumb holds the seen-set)
+    if os.clock() > crumbUntil or (lastCrumb and lastCrumb[step]) then return end
+    lastCrumb = lastCrumb or {}
+    lastCrumb[step] = true
+    table.insert(crumbs, ("%.3f %s"):format(os.clock() % 1000, step))
+    if #crumbs > 60 then table.remove(crumbs, 1) end
+    pcall(writefile, "green_crumbs.txt", "Green " .. VERSION .. "\n" .. table.concat(crumbs, "\n"))
+end
+
 local function wrap(a) a = a % 360 if a > 180 then a = a - 360 end return a end
 local function camPitch() local l = cam.CFrame.LookVector return math.deg(math.asin(l.Y)) end
 local function camYaw() local l = cam.CFrame.LookVector return math.deg(math.atan2(-l.X, -l.Z)) end
@@ -91,14 +104,18 @@ local function opponents()
     if os.clock() - oppCacheAt < 0.5 then return oppCache end
     oppCacheAt = os.clock()
     oppCache = nil
+    crumb("opponents: find court")
     local courts = workspace:FindFirstChild("Courts")
     local name = lp:GetAttribute("ActiveCourt")
     local court = courts and type(name) == "string" and courts:FindFirstChild(name)
     local slots = court and court:FindFirstChild("_CourtPlayers")
     if not slots then return nil end
+    crumb("opponents: list players")
     local players = game.Players:GetPlayers()
     local function playerIn(v)
+        crumb("opponents: read slot " .. v.Name)
         local ok, val = pcall(function() return v.Value end)
+        crumb("opponents: compare slot " .. v.Name)
         if not ok or val == nil then return nil end
         for _, pl in ipairs(players) do if val == pl then return pl end end
         return nil
@@ -117,6 +134,7 @@ local function opponents()
             if pl and pl ~= lp then table.insert(list, pl) end
         end
     end
+    crumb("opponents: done (" .. #list .. ")")
     oppCache = list
     return list
 end
@@ -202,12 +220,18 @@ end
 
 local function shiftLockOn()
     local function on()
+        crumb("shiftlock: mousemoverel")
         mousemoverel(40, 0) task.wait(0.25)
-        local l = root().CFrame.LookVector
+        crumb("shiftlock: read own root CFrame")
+        local r = root()
+        if not r then return true end
+        local l = r.CFrame.LookVector
         return math.abs(wrap(math.deg(math.atan2(-l.X, -l.Z)) - camYaw())) < 3
     end
-    if on() then return end
+    if on() then crumb("shiftlock: already on") return end
+    crumb("shiftlock: press Left Shift")
     tap(0xA0) task.wait(0.3) -- Left Shift
+    crumb("shiftlock: done")
 end
 
 -- on-screen status (kept in S so a reload always removes the previous copy's label)
@@ -249,6 +273,7 @@ local locked, firing = false, false
 local guardToggle
 local function setGuard(v, fromMenu)
     if v == AUTO_GUARD then return end
+    if v then crumbUntil = os.clock() + 5 crumbs = {} lastCrumb = nil crumb("guard switched on") end
     AUTO_GUARD = v
     if v then task.spawn(shiftLockOn) end
     if guardToggle and not fromMenu then pcall(function() guardToggle:SetValue(v) end) end
@@ -378,6 +403,7 @@ end
 -- every frame - never keep ball objects between frames, they can be destroyed.
 local function looseBallNear(pos, maxd)
     local best, bd
+    crumb("bait: scan loose balls")
     for _, f in ipairs(workspace:GetChildren()) do
         if f.Name == "Basketball" then
             local b = f:FindFirstChild("Ball")
@@ -466,25 +492,31 @@ local function guardStep()
     -- look the ball up once: it can leave their hands between two lookups
     local handler, hbFolder
     for _, pl in ipairs(opp) do
+        crumb("guard: check " .. pl.Name .. " for ball")
         local f = pl.Character and pl.Character:FindFirstChild("Basketball")
         if f then handler, hbFolder = pl, f break end
     end
+    crumb("guard: handler root")
     local hr = handler and handler.Character and handler.Character:FindFirstChild("HumanoidRootPart")
+    crumb("guard: handler ball part")
     local hball = hbFolder and hbFolder:FindFirstChild("Ball")
     if hr then
         stopRace() -- back to normal guarding: only W is used
         lastOpp = { who = handler, pos = hball and hball.Position or hr.Position, t = os.clock() }
     else
+        crumb("guard: bait check")
         local s = baitCounter(r)
         if s then return s end
         stopGuard() return "guard: opponent doesn't have the ball"
     end
+    crumb("guard: read positions")
     local hp, me = hr.Position, r.Position
     local stealing = hball ~= nil and (hp - me).Magnitude <= STEAL_RANGE
 
     local dest
     if stealing then
         -- close: run into where the dribbled ball will be (steals are touch-based)
+        crumb("guard: read ball position")
         dest = hball.Position
     else
         -- far: get between them and their hoop
@@ -497,6 +529,7 @@ local function guardStep()
         end
     end
     -- intercept: lead by about how long it takes you to get there
+    crumb("guard: their velocity")
     local v = otherVelocity(handler, hp)
     local raw = math.sqrt((dest.X - me.X)^2 + (dest.Z - me.Z)^2)
     local lead = math.clamp(raw / RUN_SPEED, STEAL_LEAD, 0.6)
@@ -514,6 +547,7 @@ local function guardStep()
     local ty = math.deg(math.atan2(-(face.X - me.X), -(face.Z - me.Z)))
     local ey = wrap(ty - camYaw())
     local ep = -8 - camPitch()
+    crumb("guard: turn + move")
     local turn = math.clamp(ey * 0.5, -30, 30) -- smooth, capped turn per frame
     if math.abs(ey) > 0.5 or math.abs(ep) > 2 then
         mousemoverel(math.floor(-turn * PX_YAW + 0.5), math.floor(-ep * PX_PITCH * 0.3 + 0.5))
