@@ -81,21 +81,41 @@ local function nearestGoal(p)
     return best, bd
 end
 
--- the players you're matched against on your court (other side of _CourtPlayers)
+-- the players you're matched against on your court (other side of _CourtPlayers).
+-- Slot values are only ever compared against the real player list, never read: an empty
+-- slot points at an invalid object, and touching it can crash the executor.
+local oppCache, oppCacheAt = nil, -1
 local function opponents()
-    local court = workspace:FindFirstChild("Courts") and workspace.Courts:FindFirstChild(tostring(lp:GetAttribute("ActiveCourt")))
+    if os.clock() - oppCacheAt < 0.5 then return oppCache end
+    oppCacheAt = os.clock()
+    oppCache = nil
+    local courts = workspace:FindFirstChild("Courts")
+    local name = lp:GetAttribute("ActiveCourt")
+    local court = courts and type(name) == "string" and courts:FindFirstChild(name)
     local slots = court and court:FindFirstChild("_CourtPlayers")
     if not slots then return nil end
-    local function playerIn(v) local ok, p = pcall(function() return v.Value end)
-        return ok and p and pcall(function() return p.ClassName end) and p.ClassName == "Player" and p or nil end
+    local players = game.Players:GetPlayers()
+    local function playerIn(v)
+        local ok, val = pcall(function() return v.Value end)
+        if not ok or val == nil then return nil end
+        for _, pl in ipairs(players) do if val == pl then return pl end end
+        return nil
+    end
     local mySide
-    for _, v in ipairs(slots:GetChildren()) do if playerIn(v) == lp then mySide = v.Name:match("^(%a+)") end end
+    for _, v in ipairs(slots:GetChildren()) do
+        local side = v.Name:match("^(%a+)")
+        if (side == "Home" or side == "Away") and playerIn(v) == lp then mySide = side end -- never touch Queue slots
+    end
     if mySide ~= "Home" and mySide ~= "Away" then return nil end
     local list = {}
     for _, v in ipairs(slots:GetChildren()) do
-        local side, p = v.Name:match("^(%a+)"), playerIn(v)
-        if p and p ~= lp and (side == "Home" or side == "Away") and side ~= mySide then table.insert(list, p) end
+        local side = v.Name:match("^(%a+)")
+        if (side == "Home" or side == "Away") and side ~= mySide then
+            local pl = playerIn(v)
+            if pl and pl ~= lp then table.insert(list, pl) end
+        end
     end
+    oppCache = list
     return list
 end
 
@@ -340,12 +360,27 @@ local function steerTo(dest, me, stopAt, goAt)
     guardW(guardMoving and math.abs(ey) < 45)
     return dist
 end
+-- find a loose ball (a Basketball folder sitting in workspace) near a point. Looked up fresh
+-- every frame - never keep ball objects between frames, they can be destroyed.
+local function looseBallNear(pos, maxd)
+    local best, bd
+    for _, f in ipairs(workspace:GetChildren()) do
+        if f.Name == "Basketball" then
+            local b = f:FindFirstChild("Ball")
+            if b then
+                local d = (b.Position - pos).Magnitude
+                if d < maxd and (not bd or d < bd) then best, bd = b, d end
+            end
+        end
+    end
+    return best
+end
 local function baitCounter(r)
-    local b = lastOpp and lastOpp.ball
-    -- someone else picked it up since (you, a teammate): it's no longer their toss
-    local holderChar = b and b.Parent and b.Parent.Parent
-    if holderChar and holderChar ~= workspace and holderChar ~= (lastOpp.who and lastOpp.who.Character) then lastOpp = nil return nil end
-    if not (b and b.Parent and b.Parent.Parent == workspace) then ballTrack = {} baitUntil = 0 return nil end -- not a loose ball
+    -- only right after the opponent lost the ball (3s), and only a ball near where it was
+    if not lastOpp or os.clock() - lastOpp.t > 3 then ballTrack = {} baitUntil = 0 return nil end
+    local searchFrom = ballTrack[#ballTrack] and ballTrack[#ballTrack][2] or lastOpp.pos
+    local b = looseBallNear(searchFrom, #ballTrack > 0 and 30 or 15)
+    if not b then ballTrack = {} baitUntil = 0 return nil end
     local who = lastOpp.who
     local now, p = os.clock(), b.Position
     if #ballTrack == 0 then ballTrack.start = now end
@@ -361,7 +396,7 @@ local function baitCounter(r)
     v = Vector3.new(v.X, v.Y - G * dt / 2, v.Z)
     local me = r.Position
     local catchY = me.Y + 2
-    if p.Y < catchY - 1 and v.Y < 0 then baitUntil = 0 return nil end -- it's down; normal guarding takes over
+    if p.Y < catchY - 1 then baitUntil = 0 return nil end -- on the floor / coming down past you: not a toss to race for
     -- where it comes down to catch height
     local dy = p.Y - catchY
     local disc = v.Y*v.Y + 2*G*dy
@@ -408,7 +443,7 @@ local function guardStep()
     local hball = hbFolder and hbFolder:FindFirstChild("Ball")
     if hr then
         stopRace() -- back to normal guarding: only W is used
-        lastOpp = hball and { ball = hball, who = handler } or lastOpp
+        lastOpp = { who = handler, pos = hball and hball.Position or hr.Position, t = os.clock() }
     else
         local s = baitCounter(r)
         if s then return s end
